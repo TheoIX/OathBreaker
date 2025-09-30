@@ -1,16 +1,18 @@
 --[[
-OathBreaker.lua - Turtle WoW 1.12 (Lua 5.0 safe) - v1.1.2
+OathBreaker.lua - Turtle WoW 1.12 (Lua 5.0 safe) - v1.2.1
 Author: Theodan
 
-Plain-ASCII. ArcaneFlow-style slash registration. Balanced ends verified.
+Priority Mode refinement:
+  • Anchor-specific tracking using the *exact* Holy Strength aura instance
+    (via expiration-time fingerprint) so we ONLY return to A when A’s proc
+    drops — not when B/C fall off.
+  • Round-robin still available. Quiet retries by default.
 
-Behavior:
-  • Each /oathbreaker press retries a pending swap until it verifies equipped.
-  • Only prints when the weapon actually switches (quiet retries by default).
-  • /obverbose to see retry output; /obquiet to silence again.
-
-Slash:
-  /oathbreaker  /obadd  /obdel  /oblist  /obclear  /obnext  /obping  /obdebug  /obquiet  /obverbose
+New/Relevant slash:
+  /obmode priority | round     -- choose priority (anchor-first) or round-robin
+  /obanchor <idx|name>         -- choose which queue slot is the anchor (default: 1)
+  /obquiet /obverbose          -- toggle chat noise (quiet by default)
+  /oathbreaker                 -- press to run logic (no background loops)
 ]]
 
 -- ===== Fast locals (do NOT localize DEFAULT_CHAT_FRAME) =====
@@ -53,13 +55,21 @@ OB_NextIndex    = 1
 -- Detection state
 OB_Primed       = false
 OB_LastCount    = 0
-OB_LastExpSet   = {}   -- set[exp]=true when fingerprinting
+OB_LastExpSet   = {}   -- set[exp]=true for last scan (fingerprint mode)
 
 -- Equip pending state (press-to-press retries)
 OB_PendingName  = nil
 
 -- Chat verbosity
 OB_Quiet        = true  -- default: only print on successful swaps
+
+-- Priority mode state
+OB_ModePriority = true   -- priority (anchor-first) enabled by default
+OB_AnchorIndex  = 1      -- first item in queue is the anchor
+OB_Chasing      = false  -- after anchor proc, trying B/C...
+OB_BaseCount    = 0      -- fallback baseline if fingerprints are unavailable
+OB_ChaseIndex   = 2      -- next weapon to try in priority mode
+OB_AnchorExp    = nil    -- expiration fingerprint of the *anchor* HS instance
 
 -- ===== Chat helpers =====
 local function Frame()
@@ -125,6 +135,17 @@ local function AdvanceIdx()
   if OB_NextIndex > getn(OB_Queue) then OB_NextIndex = 1 end
 end
 
+local function AdvanceChase()
+  local n = getn(OB_Queue)
+  if n <= 1 then OB_ChaseIndex = 1; return end
+  OB_ChaseIndex = OB_ChaseIndex + 1
+  if OB_ChaseIndex > n then OB_ChaseIndex = 1 end
+  if OB_ChaseIndex == OB_AnchorIndex then
+    OB_ChaseIndex = OB_ChaseIndex + 1
+    if OB_ChaseIndex > n then OB_ChaseIndex = 1 end
+  end
+end
+
 -- ===== Equip attempt (single-press try) =====
 local function TryEquipOnce(name)
   if not name or name == "" then return false end
@@ -141,7 +162,7 @@ local function TryEquipOnce(name)
     if IsMainHandEquipped(name) then return true end
   end
 
-  -- 3) Bag-scan soft use
+  -- 3) Bag-scan soft use, then hard swap
   if type(GetContainerNumSlots) == "function" and type(GetContainerItemLink) == "function" then
     local bag
     for bag = 0, 4 do
@@ -156,7 +177,6 @@ local function TryEquipOnce(name)
               UseContainerItem(bag, slot)
               if IsMainHandEquipped(name) then return true end
             end
-            -- 4) Hard swap via pickup/put
             if type(PickupContainerItem) == "function" and type(PickupInventoryItem) == "function" then
               PickupContainerItem(bag, slot)
               if CursorHasItem and CursorHasItem() then
@@ -175,11 +195,13 @@ local function TryEquipOnce(name)
   return IsMainHandEquipped(name)
 end
 
--- ===== Holy Strength detection =====
+-- ===== Fingerprint helpers =====
+local function FingerprintCapable()
+  return (type(GetPlayerBuff)=="function" and type(GetPlayerBuffTimeLeft)=="function" and type(GetPlayerBuffTexture)=="function")
+end
+
 local function FingerprintHS()
-  if not (type(GetPlayerBuff) == "function" and type(GetPlayerBuffTimeLeft) == "function" and type(GetPlayerBuffTexture) == "function") then
-    return nil
-  end
+  if not FingerprintCapable() then return nil end
   local exps = {}
   local i = 0
   while true do
@@ -195,6 +217,13 @@ local function FingerprintHS()
   end
   if getn(exps) == 0 then return {} end
   return exps
+end
+
+local function BuildSetFromExps(exps)
+  local s = {}
+  local i
+  for i = 1, (exps and getn(exps) or 0) do s[exps[i]] = true end
+  return s
 end
 
 local function CountHS_ByTooltip()
@@ -215,29 +244,34 @@ local function CountHS_ByTooltip()
   return c
 end
 
+local function OB_CurrentHSCount()
+  local exps = FingerprintHS()
+  if exps then return getn(exps) end
+  return CountHS_ByTooltip()
+end
+
+-- Returns true if a *new* HS appeared since last scan. Also updates OB_LastExpSet/OB_LastCount
 local function IsNewHolyStrength()
   local exps = FingerprintHS()
   if exps then
+    local currSet = BuildSetFromExps(exps)
     if not OB_Primed then
       OB_Primed = true
-      OB_LastExpSet = {}
-      local k
-      for k = 1, getn(exps) do OB_LastExpSet[exps[k]] = true end
-      OB_LastCount = getn(exps)
+      OB_LastExpSet = currSet
+      OB_LastCount  = getn(exps)
       return false
     end
     local foundNew = false
-    local j
-    for j = 1, getn(exps) do
-      local v = exps[j]
+    local i
+    for i = 1, getn(exps) do
+      local v = exps[i]
       if not OB_LastExpSet[v] then foundNew = true; break end
     end
-    OB_LastExpSet = {}
-    for j = 1, getn(exps) do OB_LastExpSet[exps[j]] = true end
-    OB_LastCount = getn(exps)
+    OB_LastExpSet = currSet
+    OB_LastCount  = getn(exps)
     return foundNew
   end
-  -- count fallback
+  -- count fallback only
   local c = CountHS_ByTooltip()
   if not OB_Primed then OB_Primed = true; OB_LastCount = c; return false end
   local isNew = (c > OB_LastCount)
@@ -247,43 +281,125 @@ end
 
 -- ===== Main pulse =====
 function OathBreaker_Pulse()
+  local n = getn(OB_Queue)
+  if n == 0 then OB_Err("Queue empty. Use /obadd <weapon>.") return end
+
   -- 1) If we have a pending swap, keep trying until verified
   if OB_PendingName then
     if IsMainHandEquipped(OB_PendingName) then
       OB_Msg("Equipped: " .. OB_PendingName)
+      if not OB_ModePriority then AdvanceIdx() end
       OB_PendingName = nil
-      AdvanceIdx()
       return
     end
-    if not OB_Quiet then OB_Msg("Trying to equip: " .. OB_PendingName) end
     local ok = TryEquipOnce(OB_PendingName)
     if ok then
       OB_Msg("Equipped: " .. OB_PendingName)
+      if not OB_ModePriority then AdvanceIdx() end
       OB_PendingName = nil
-      AdvanceIdx()
-    else
-      if not OB_Quiet then OB_Err("Equip failed (locked/casting). Press again: " .. OB_PendingName) end
     end
     return
   end
 
-  -- 2) Otherwise, scan for a NEW Holy Strength proc
-  if IsNewHolyStrength() then
-    local n = getn(OB_Queue)
-    if n == 0 then if not OB_Quiet then OB_Err("Queue empty. Use /obadd <weapon>.") end return end
-    local tries = 0
-    while tries < n do
-      local nextName = OB_Queue[OB_NextIndex]
-      if not IsMainHandEquipped(nextName) then
-        OB_PendingName = nextName
-        if not OB_Quiet then OB_Msg("New Holy Strength! Pending equip: " .. nextName .. " (press again if blocked)") end
-        return
+  -- 2) Mode-specific behavior
+  if OB_ModePriority then
+    -- ensure indices sane
+    if OB_AnchorIndex < 1 or OB_AnchorIndex > n then OB_AnchorIndex = 1 end
+    if OB_ChaseIndex  < 1 or OB_ChaseIndex  > n then OB_ChaseIndex  = 2 end
+    if OB_ChaseIndex == OB_AnchorIndex then AdvanceChase() end
+
+    -- capture previous set BEFORE checking for new
+    local prevSet = nil
+    if FingerprintCapable() then
+      prevSet = OB_LastExpSet -- this is from last pulse; good enough for diff
+    end
+
+    if OB_Chasing then
+      if FingerprintCapable() and OB_AnchorExp then
+        -- anchor considered fallen if its specific exp is gone
+        local currExps = FingerprintHS()
+        local currSet  = BuildSetFromExps(currExps)
+        if not currSet[OB_AnchorExp] then
+          local anchorName = OB_Queue[OB_AnchorIndex]
+          if not IsMainHandEquipped(anchorName) then OB_PendingName = anchorName end
+          OB_Chasing   = false
+          OB_AnchorExp = nil
+          OB_Primed    = false
+          return
+        end
       else
-        AdvanceIdx()
-        tries = tries + 1
+        -- fallback: if total drops below baseline, assume anchor fell
+        local curr = OB_CurrentHSCount()
+        if curr < OB_BaseCount then
+          local anchorName = OB_Queue[OB_AnchorIndex]
+          if not IsMainHandEquipped(anchorName) then OB_PendingName = anchorName end
+          OB_Chasing   = false
+          OB_AnchorExp = nil
+          OB_Primed    = false
+          return
+        end
+      end
+
+      -- handle chaining: if a new HS appeared, move to next chase target
+      if IsNewHolyStrength() then
+        OB_BaseCount = OB_CurrentHSCount()
+        AdvanceChase()
+        local nextName = OB_Queue[OB_ChaseIndex]
+        if not IsMainHandEquipped(nextName) then OB_PendingName = nextName end
+        return
+      end
+      return
+    else
+      -- not chasing: look for a *fresh* anchor proc
+      if IsNewHolyStrength() then
+        -- fingerprint the *new* one to stick to the anchor instance
+        if FingerprintCapable() then
+          local currExps = FingerprintHS()
+          local currSet  = BuildSetFromExps(currExps)
+          -- Find exp value that wasn't in prevSet
+          local newExp = nil
+          local i
+          for i = 1, (currExps and getn(currExps) or 0) do
+            local v = currExps[i]
+            if not (prevSet and prevSet[v]) then newExp = v; break end
+          end
+          if not newExp then
+            -- fallback: pick max exp (youngest buff)
+            local maxv = nil
+            for i = 1, (currExps and getn(currExps) or 0) do
+              local v = currExps[i]
+              if not maxv or v > maxv then maxv = v end
+            end
+            newExp = maxv
+          end
+          OB_AnchorExp = newExp
+          OB_LastExpSet = currSet
+        end
+        OB_BaseCount = OB_CurrentHSCount()
+        OB_Chasing   = true
+        OB_ChaseIndex = OB_AnchorIndex + 1; if OB_ChaseIndex > n then OB_ChaseIndex = 1 end
+        if OB_ChaseIndex == OB_AnchorIndex then AdvanceChase() end
+        local nextName = OB_Queue[OB_ChaseIndex]
+        if not IsMainHandEquipped(nextName) then OB_PendingName = nextName end
+        return
+      end
+      return
+    end
+  else
+    -- Round-robin (legacy)
+    if IsNewHolyStrength() then
+      local tries = 0
+      while tries < n do
+        local nextName = OB_Queue[OB_NextIndex]
+        if not IsMainHandEquipped(nextName) then
+          OB_PendingName = nextName
+          return
+        else
+          AdvanceIdx()
+          tries = tries + 1
+        end
       end
     end
-    if not OB_Quiet then OB_Msg("All queued weapons already equipped; nothing to swap.") end
   end
 end
 
@@ -293,86 +409,150 @@ function OB_Add_Slash(msg)
   if name == "" then OB_Err("Usage: /obadd <weapon or item link>") return end
   tinsert(OB_Queue, name)
   OB_Msg("Added " .. name .. " at position " .. getn(OB_Queue) .. ".")
-  if getn(OB_Queue) == 1 then OB_NextIndex = 1 end
+  if getn(OB_Queue) == 1 then
+    OB_NextIndex   = 1
+    OB_AnchorIndex = 1
+    OB_ChaseIndex  = 2
+  end
 end
 
 function OB_Del_Slash(msg)
   local arg = NormalizeItemInput(msg)
   if arg == "" then OB_Err("Usage: /obdel <index|weapon or item link>") return end
   local idx = tonumber(arg)
-  if idx and idx >= 1 and idx <= getn(OB_Queue) then
+  local n = getn(OB_Queue)
+  if idx and idx >= 1 and idx <= n then
     local removed = table.remove(OB_Queue, idx)
     OB_Msg("Removed position " .. idx .. ": " .. removed)
-    if OB_NextIndex > getn(OB_Queue) then OB_NextIndex = 1 end
-    return
-  end
-  local targetLower = strlower(arg)
-  local i
-  for i = 1, getn(OB_Queue) do
-    local nm = OB_Queue[i]
-    if strlower(nm) == targetLower then
-      table.remove(OB_Queue, i)
-      OB_Msg("Removed: " .. nm)
-      if OB_NextIndex > getn(OB_Queue) then OB_NextIndex = 1 end
-      return
+  else
+    local targetLower = strlower(arg)
+    local i
+    for i = 1, n do
+      local nm = OB_Queue[i]
+      if strlower(nm) == targetLower then
+        table.remove(OB_Queue, i)
+        OB_Msg("Removed: " .. nm)
+        break
+      end
     end
   end
-  OB_Err("Not found in queue: " .. arg)
+  local nn = getn(OB_Queue)
+  if nn == 0 then
+    OB_NextIndex   = 1
+    OB_AnchorIndex = 1
+    OB_ChaseIndex  = 2
+    OB_Chasing     = false
+    OB_AnchorExp   = nil
+    return
+  end
+  if OB_AnchorIndex > nn then OB_AnchorIndex = 1 end
+  if OB_ChaseIndex  > nn then OB_ChaseIndex  = 1 end
+  if OB_NextIndex   > nn then OB_NextIndex   = 1 end
 end
 
 function OB_List_Slash()
-  if getn(OB_Queue) == 0 then OB_Msg("Queue empty. Use /obadd <weapon>.") return end
-  OB_Msg("Queue (next -> #" .. OB_NextIndex .. "):")
+  local n = getn(OB_Queue)
+  if n == 0 then OB_Msg("Queue empty. Use /obadd <weapon>.") return end
+  local mode = OB_ModePriority and "PRIORITY" or "ROUND"
+  OB_Msg("Queue (mode=" .. mode .. ", anchor=#" .. OB_AnchorIndex .. "):")
   local i
-  for i = 1, getn(OB_Queue) do
-    local marker = (i == OB_NextIndex) and "-> " or "   "
-    local f = Frame(); if f and f.AddMessage then f:AddMessage(marker .. i .. ". " .. OB_Queue[i], 0.9, 0.9, 0.9) end
+  for i = 1, n do
+    local marks = ""
+    if i == OB_AnchorIndex then marks = marks .. "[A]" end
+    if i == OB_NextIndex then marks = marks .. "[N]" end
+    if i == OB_ChaseIndex and OB_Chasing then marks = marks .. "[C]" end
+    local f = Frame(); if f and f.AddMessage then f:AddMessage(string.format(" %2d. %s %s", i, OB_Queue[i], marks), 0.9, 0.9, 0.9) end
   end
 end
 
 function OB_Clear_Slash()
   OB_Queue = {}
-  OB_NextIndex = 1
+  OB_NextIndex   = 1
   OB_PendingName = nil
+  OB_Chasing     = false
+  OB_BaseCount   = 0
+  OB_AnchorExp   = nil
   OB_Msg("Queue cleared.")
 end
 
 function OB_Next_Slash()
-  if getn(OB_Queue) == 0 then OB_Err("Queue empty. Use /obadd <weapon>.") return end
-  if not OB_PendingName then
-    local name = OB_Queue[OB_NextIndex]
-    if IsMainHandEquipped(name) then AdvanceIdx(); name = OB_Queue[OB_NextIndex] end
-    OB_PendingName = name
+  local n = getn(OB_Queue)
+  if n == 0 then OB_Err("Queue empty. Use /obadd <weapon>.") return end
+  local name
+  if OB_ModePriority then
+    if OB_Chasing then name = OB_Queue[OB_ChaseIndex] else name = OB_Queue[OB_AnchorIndex] end
+  else
+    name = OB_Queue[OB_NextIndex]
   end
+  if not OB_PendingName then OB_PendingName = name end
   OathBreaker_Pulse()
 end
 
-function OB_Ping_Slash()
-  OB_Msg("ping")
-end
+function OB_Ping_Slash()  OB_Msg("ping") end
 
 function OB_Debug_Slash()
   local f = Frame()
   if f and f.AddMessage then
-    f:AddMessage(OB_PREFIX .. "DCF=" .. type(DEFAULT_CHAT_FRAME) .. ", CF1=" .. type(ChatFrame1) .. ", Q=" .. type(OB_Queue) .. ", Quiet=" .. tostring(OB_Quiet))
+    f:AddMessage(OB_PREFIX .. "DCF=" .. type(DEFAULT_CHAT_FRAME) .. ", CF1=" .. type(ChatFrame1) .. ", Q=" .. type(OB_Queue) .. ", Quiet=" .. tostring(OB_Quiet) .. ", ModePriority=" .. tostring(OB_ModePriority))
   end
 end
 
 local function OB_SetQuiet(on)
   OB_Quiet = (on and true) or false
-  if OB_Quiet then
-    OB_Msg("Quiet mode: on (only prints on successful swaps)")
+  if OB_Quiet then OB_Msg("Quiet mode: on") else OB_Msg("Quiet mode: off") end
+end
+
+function OB_Quiet_Slash()  OB_SetQuiet(true)  end
+function OB_Verbose_Slash() OB_SetQuiet(false) end
+
+local function OB_SetModePriority(on)
+  OB_ModePriority = (on and true) or false
+  OB_Chasing     = false
+  OB_PendingName = nil
+  OB_Primed      = false
+  OB_AnchorExp   = nil
+  if OB_ModePriority then
+    OB_Msg("Mode: PRIORITY (anchor-first). Anchor is queue #" .. OB_AnchorIndex)
   else
-    OB_Msg("Quiet mode: off (shows retries)")
+    OB_Msg("Mode: ROUND (classic round-robin)")
   end
 end
 
-function OB_Quiet_Slash()
-  OB_SetQuiet(true)
+function OB_Mode_Slash(msg)
+  local a = Trim(msg or "")
+  if a == "priority" then OB_SetModePriority(true); return end
+  if a == "round" or a == "rr" then OB_SetModePriority(false); return end
+  OB_Err("Usage: /obmode priority | round")
 end
 
-function OB_Verbose_Slash()
-  OB_SetQuiet(false)
+function OB_Priority_Slash(msg)
+  local a = Trim(msg or "")
+  if a == "on" or a == "1" then OB_SetModePriority(true); return end
+  if a == "off" or a == "0" then OB_SetModePriority(false); return end
+  OB_Err("Usage: /obpriority on|off")
+end
+
+function OB_Anchor_Slash(msg)
+  local a = NormalizeItemInput(msg)
+  local n = getn(OB_Queue)
+  if n == 0 then OB_Err("Queue empty. Add weapons first."); return end
+  local idx = tonumber(a)
+  if idx then
+    if idx < 1 or idx > n then OB_Err("Anchor index out of range (1-" .. n .. ")"); return end
+    OB_AnchorIndex = idx
+    OB_Msg("Anchor set to #" .. idx .. ": " .. OB_Queue[idx])
+    return
+  end
+  local i
+  local targetLower = strlower(a)
+  for i = 1, n do
+    if strlower(OB_Queue[i]) == targetLower then
+      OB_AnchorIndex = i
+      OB_Msg("Anchor set to #" .. i .. ": " .. OB_Queue[i])
+      return
+    end
+  end
+  OB_Err("Anchor not found: " .. a)
 end
 
 -- ===== Slash registration (ArcaneFlow style) =====
@@ -406,3 +586,13 @@ SlashCmdList["OBQUIET"] = OB_Quiet_Slash
 SLASH_OBVERBOSE1 = "/obverbose"
 SlashCmdList["OBVERBOSE"] = OB_Verbose_Slash
 
+SLASH_OBMODE1 = "/obmode"
+SlashCmdList["OBMODE"] = OB_Mode_Slash
+
+SLASH_OBPRIORITY1 = "/obpriority"
+SlashCmdList["OBPRIORITY"] = OB_Priority_Slash
+
+SLASH_OBANCHOR1 = "/obanchor"
+SlashCmdList["OBANCHOR"] = OB_Anchor_Slash
+
+-- End of OathBreaker.lua
