@@ -1,0 +1,7 @@
+## Interface: 11200
+## Title: OathBreaker
+## Notes: Cycle weapons when a |cffffd000Holy Strength|r buff appears (Crusader)
+## Author: Marc / Theodan × GPT
+## Version: 0.9
+
+OathBreaker.lua
