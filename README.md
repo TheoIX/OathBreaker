@@ -21,7 +21,7 @@ OathBreaker runs **only when you press the slash command** (no background loops)
   * If a swap is **pending**, it keeps trying until the weapon is verified equipped.
   * Otherwise, it scans for a **new Holy Strength** proc; if detected, it marks the next weapon in your queue as **pending** (skips if that weapon is already equipped).
 
-> Tip: Bind `/oathbreaker` to a comfy key. The addon is designed to work exactly on your keypresses, not on timers.
+> Tip: Bind `/oathbreaker` to a comfy key. The addon is designed to work exactly on your keypresses, not on timers. If you make macros for your spellcast put /oathbreaker at the top of your macro.
 
 ---
 
