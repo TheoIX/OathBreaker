@@ -94,4 +94,4 @@ Optional debug tools:
 /oblist
 /oathbreaker   (press during combat; on a new Holy Strength, it starts the next swap)
 ```
-
+/obpriority on/off  added.  keep preferred weapon in the number 1 slot for maximum uptime with that weapon. 
