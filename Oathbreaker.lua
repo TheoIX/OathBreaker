@@ -1,6 +1,6 @@
 --[[
 OathBreaker.lua - Turtle WoW 1.12 (Lua 5.0 safe) - v1.1.2
-Author: Marc / Theodan x GPT
+Author: Theodan
 
 Plain-ASCII. ArcaneFlow-style slash registration. Balanced ends verified.
 
@@ -405,3 +405,4 @@ SlashCmdList["OBQUIET"] = OB_Quiet_Slash
 
 SLASH_OBVERBOSE1 = "/obverbose"
 SlashCmdList["OBVERBOSE"] = OB_Verbose_Slash
+
