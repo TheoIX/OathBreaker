@@ -1,18 +1,30 @@
 --[[
-OathBreaker.lua - Turtle WoW 1.12 (Lua 5.0 safe) - v1.2.1
+OathBreaker.lua - Turtle WoW 1.12 (Lua 5.0 safe) - v1.3
 Author: Theodan
 
-Priority Mode refinement:
-  • Anchor-specific tracking using the *exact* Holy Strength aura instance
-    (via expiration-time fingerprint) so we ONLY return to A when A’s proc
-    drops — not when B/C fall off.
-  • Round-robin still available. Quiet retries by default.
+NEW in v1.3 (Priority-only cooldowns):
+  • Per-weapon soft cooldowns: when a weapon procs Holy Strength, it
+    gets a cooldown (default 13s) during which it will NOT be picked again.
+  • Anchor (priority) soft cooldown behavior: when the anchor's cooldown
+    reaches 0, OathBreaker will immediately switch back to the anchor even if
+    the current weapon hasn't procced yet (still within the same HS window).
+  • Round-robin mode is UNCHANGED — cooldowns are ignored there.
+  • Slash: /obcd <seconds> to set per-weapon cooldown (priority mode only).
+           /obcdlist to display remaining cooldowns.
 
-New/Relevant slash:
+Retains v1.2.1 Priority Mode refinements:
+  • Anchor-specific tracking using the exact Holy Strength aura instance
+    (via expiration-time fingerprint) so we ONLY return to A when A’s proc
+    drops — unless the new soft-CD rule pulls us back earlier.
+  • Quiet retries by default.
+
+Key slash commands:
   /obmode priority | round     -- choose priority (anchor-first) or round-robin
   /obanchor <idx|name>         -- choose which queue slot is the anchor (default: 1)
   /obquiet /obverbose          -- toggle chat noise (quiet by default)
   /oathbreaker                 -- press to run logic (no background loops)
+  /obcd <seconds>              -- set soft cooldown window (default 13) for PRIORITY mode
+  /obcdlist                    -- show remaining cooldowns per weapon
 ]]
 
 -- ===== Fast locals (do NOT localize DEFAULT_CHAT_FRAME) =====
@@ -70,6 +82,10 @@ OB_Chasing      = false  -- after anchor proc, trying B/C...
 OB_BaseCount    = 0      -- fallback baseline if fingerprints are unavailable
 OB_ChaseIndex   = 2      -- next weapon to try in priority mode
 OB_AnchorExp    = nil    -- expiration fingerprint of the *anchor* HS instance
+
+-- NEW: Per-weapon cooldowns (priority mode ONLY)
+OB_CD_WINDOW    = 13     -- default seconds (can be changed via /obcd)
+OB_Cooldowns    = {}     -- map[strlower(name)] = expiresAt (GetTime-based)
 
 -- ===== Chat helpers =====
 local function Frame()
@@ -130,6 +146,13 @@ local function IsMainHandEquipped(name)
   return eq and (strlower(eq) == strlower(name))
 end
 
+local function GetEquippedMHName()
+  if type(GetInventoryItemLink) ~= "function" then return nil end
+  local link = GetInventoryItemLink("player", 16)
+  if not link then return nil end
+  return ExtractNameFromLink(link)
+end
+
 local function AdvanceIdx()
   OB_NextIndex = OB_NextIndex + 1
   if OB_NextIndex > getn(OB_Queue) then OB_NextIndex = 1 end
@@ -144,6 +167,65 @@ local function AdvanceChase()
     OB_ChaseIndex = OB_ChaseIndex + 1
     if OB_ChaseIndex > n then OB_ChaseIndex = 1 end
   end
+end
+
+-- ===== Cooldown helpers (priority mode only) =====
+local function Now()
+  return (type(GetTime)=="function" and GetTime()) or 0
+end
+
+local function KeyFor(name)
+  return name and strlower(name) or nil
+end
+
+local function StartCooldown(name)
+  if not name or name == "" then return end
+  if not OB_ModePriority then return end -- only track in priority mode
+  OB_Cooldowns[KeyFor(name)] = Now() + (OB_CD_WINDOW or 13)
+end
+
+local function SecondsLeft(name)
+  if not name or name == "" then return 0 end
+  local t = OB_Cooldowns[KeyFor(name)]
+  if not t then return 0 end
+  local left = t - Now()
+  if left < 0 then left = 0 end
+  return left
+end
+
+local function IsOnCooldown(name)
+  return SecondsLeft(name) > 0
+end
+
+local function NextChaseCandidate()
+  local n = getn(OB_Queue)
+  if n == 0 then return nil, nil end
+  local i = OB_ChaseIndex
+  local start = i
+  repeat
+    local nm = OB_Queue[i]
+    if i ~= OB_AnchorIndex and not IsOnCooldown(nm) then
+      return i, nm
+    end
+    i = i + 1; if i > n then i = 1 end
+  until i == start
+  return nil, nil
+end
+
+-- If every non-anchor weapon is on cooldown, prefer anchor for max uptime
+local function AllNonAnchorOnCooldown()
+  local n = getn(OB_Queue)
+  if n <= 1 then return true end
+  local i
+  for i = 1, n do
+    if i ~= OB_AnchorIndex then
+      local nm = OB_Queue[i]
+      if SecondsLeft(nm) == 0 then
+        return false
+      end
+    end
+  end
+  return true
 end
 
 -- ===== Equip attempt (single-press try) =====
@@ -210,7 +292,7 @@ local function FingerprintHS()
     local tex = GetPlayerBuffTexture(idx)
     if tex and strfind(strlower(tex), HOLY_ICON_SUB, 1, true) then
       local tl = GetPlayerBuffTimeLeft(idx) or 0
-      local exp = floor(GetTime() + tl + 0.5)
+      local exp = floor(Now() + tl + 0.5)
       tinsert(exps, exp)
     end
     i = i + 1
@@ -287,14 +369,14 @@ function OathBreaker_Pulse()
   -- 1) If we have a pending swap, keep trying until verified
   if OB_PendingName then
     if IsMainHandEquipped(OB_PendingName) then
-      OB_Msg("Equipped: " .. OB_PendingName)
+      if not OB_Quiet then OB_Msg("Equipped: " .. OB_PendingName) end
       if not OB_ModePriority then AdvanceIdx() end
       OB_PendingName = nil
       return
     end
     local ok = TryEquipOnce(OB_PendingName)
     if ok then
-      OB_Msg("Equipped: " .. OB_PendingName)
+      if not OB_Quiet then OB_Msg("Equipped: " .. OB_PendingName) end
       if not OB_ModePriority then AdvanceIdx() end
       OB_PendingName = nil
     end
@@ -308,19 +390,37 @@ function OathBreaker_Pulse()
     if OB_ChaseIndex  < 1 or OB_ChaseIndex  > n then OB_ChaseIndex  = 2 end
     if OB_ChaseIndex == OB_AnchorIndex then AdvanceChase() end
 
+    local anchorName = OB_Queue[OB_AnchorIndex]
+
+    -- EARLY RETURN TO ANCHOR when its soft-CD expires (even if no new proc)
+    if OB_Chasing and SecondsLeft(anchorName) == 0 then
+      if not IsMainHandEquipped(anchorName) then OB_PendingName = anchorName end
+      OB_Chasing   = false
+      OB_AnchorExp = nil     -- stop tracking the old anchor instance
+      OB_Primed    = false   -- re-prime for next new HS
+      return
+    end
+
     -- capture previous set BEFORE checking for new
     local prevSet = nil
     if FingerprintCapable() then
-      prevSet = OB_LastExpSet -- this is from last pulse; good enough for diff
+      prevSet = OB_LastExpSet -- from last pulse; good enough for diff
     end
 
     if OB_Chasing then
+      -- If all non-anchor weapons are on cooldown, snap back to anchor
+      if AllNonAnchorOnCooldown() then
+        if not IsMainHandEquipped(anchorName) then OB_PendingName = anchorName end
+        OB_Chasing   = false
+        OB_AnchorExp = nil
+        OB_Primed    = false
+        return
+      end
+      -- while chasing, if anchor's specific instance fell, return to anchor
       if FingerprintCapable() and OB_AnchorExp then
-        -- anchor considered fallen if its specific exp is gone
         local currExps = FingerprintHS()
         local currSet  = BuildSetFromExps(currExps)
         if not currSet[OB_AnchorExp] then
-          local anchorName = OB_Queue[OB_AnchorIndex]
           if not IsMainHandEquipped(anchorName) then OB_PendingName = anchorName end
           OB_Chasing   = false
           OB_AnchorExp = nil
@@ -331,7 +431,6 @@ function OathBreaker_Pulse()
         -- fallback: if total drops below baseline, assume anchor fell
         local curr = OB_CurrentHSCount()
         if curr < OB_BaseCount then
-          local anchorName = OB_Queue[OB_AnchorIndex]
           if not IsMainHandEquipped(anchorName) then OB_PendingName = anchorName end
           OB_Chasing   = false
           OB_AnchorExp = nil
@@ -340,18 +439,31 @@ function OathBreaker_Pulse()
         end
       end
 
-      -- handle chaining: if a new HS appeared, move to next chase target
+      -- handle chaining: if a new HS appeared, mark CD for current weapon,
+      -- then move to the next chase target that is NOT on cooldown
       if IsNewHolyStrength() then
+        local currW = GetEquippedMHName(); if currW then StartCooldown(currW) end
         OB_BaseCount = OB_CurrentHSCount()
-        AdvanceChase()
-        local nextName = OB_Queue[OB_ChaseIndex]
-        if not IsMainHandEquipped(nextName) then OB_PendingName = nextName end
+        -- pick next non-CD candidate
+        local idx, nm = NextChaseCandidate()
+        if idx and nm then
+          OB_ChaseIndex = idx
+          if not IsMainHandEquipped(nm) then OB_PendingName = nm end
+        else
+          -- No eligible non-anchor (all on cooldown): favor anchor uptime
+          if not IsMainHandEquipped(anchorName) then OB_PendingName = anchorName end
+          OB_Chasing   = false
+          OB_AnchorExp = nil
+          OB_Primed    = false
+        end
         return
       end
       return
     else
       -- not chasing: look for a *fresh* anchor proc
       if IsNewHolyStrength() then
+        -- start cooldown for the weapon that just procced (should be anchor)
+        local currW = GetEquippedMHName(); if currW then StartCooldown(currW) end
         -- fingerprint the *new* one to stick to the anchor instance
         if FingerprintCapable() then
           local currExps = FingerprintHS()
@@ -377,16 +489,20 @@ function OathBreaker_Pulse()
         end
         OB_BaseCount = OB_CurrentHSCount()
         OB_Chasing   = true
+        -- initialize chase index then pick a non-CD candidate
         OB_ChaseIndex = OB_AnchorIndex + 1; if OB_ChaseIndex > n then OB_ChaseIndex = 1 end
         if OB_ChaseIndex == OB_AnchorIndex then AdvanceChase() end
-        local nextName = OB_Queue[OB_ChaseIndex]
-        if not IsMainHandEquipped(nextName) then OB_PendingName = nextName end
+        local idx, nm = NextChaseCandidate()
+        if idx and nm then
+          OB_ChaseIndex = idx
+          if not IsMainHandEquipped(nm) then OB_PendingName = nm end
+        end
         return
       end
       return
     end
   else
-    -- Round-robin (legacy)
+    -- Round-robin (legacy) — cooldowns intentionally ignored
     if IsNewHolyStrength() then
       local tries = 0
       while tries < n do
@@ -443,6 +559,7 @@ function OB_Del_Slash(msg)
     OB_ChaseIndex  = 2
     OB_Chasing     = false
     OB_AnchorExp   = nil
+    OB_Cooldowns   = {}
     return
   end
   if OB_AnchorIndex > nn then OB_AnchorIndex = 1 end
@@ -461,7 +578,9 @@ function OB_List_Slash()
     if i == OB_AnchorIndex then marks = marks .. "[A]" end
     if i == OB_NextIndex then marks = marks .. "[N]" end
     if i == OB_ChaseIndex and OB_Chasing then marks = marks .. "[C]" end
-    local f = Frame(); if f and f.AddMessage then f:AddMessage(string.format(" %2d. %s %s", i, OB_Queue[i], marks), 0.9, 0.9, 0.9) end
+    local cdLeft = SecondsLeft(OB_Queue[i])
+    local cdStr = (OB_ModePriority and cdLeft > 0) and (" [CD " .. string.format("%ds", floor(cdLeft + 0.5)) .. "]") or ""
+    local f = Frame(); if f and f.AddMessage then f:AddMessage(string.format(" %2d. %s %s%s", i, OB_Queue[i], marks, cdStr), 0.9, 0.9, 0.9) end
   end
 end
 
@@ -472,6 +591,7 @@ function OB_Clear_Slash()
   OB_Chasing     = false
   OB_BaseCount   = 0
   OB_AnchorExp   = nil
+  OB_Cooldowns   = {}
   OB_Msg("Queue cleared.")
 end
 
@@ -493,7 +613,7 @@ function OB_Ping_Slash()  OB_Msg("ping") end
 function OB_Debug_Slash()
   local f = Frame()
   if f and f.AddMessage then
-    f:AddMessage(OB_PREFIX .. "DCF=" .. type(DEFAULT_CHAT_FRAME) .. ", CF1=" .. type(ChatFrame1) .. ", Q=" .. type(OB_Queue) .. ", Quiet=" .. tostring(OB_Quiet) .. ", ModePriority=" .. tostring(OB_ModePriority))
+    f:AddMessage(OB_PREFIX .. "DCF=" .. type(DEFAULT_CHAT_FRAME) .. ", CF1=" .. type(ChatFrame1) .. ", Q=" .. type(OB_Queue) .. ", Quiet=" .. tostring(OB_Quiet) .. ", ModePriority=" .. tostring(OB_ModePriority) .. ", CDWin=" .. tostring(OB_CD_WINDOW))
   end
 end
 
@@ -511,6 +631,7 @@ local function OB_SetModePriority(on)
   OB_PendingName = nil
   OB_Primed      = false
   OB_AnchorExp   = nil
+  -- Keep OB_Cooldowns table, but it only matters in priority mode
   if OB_ModePriority then
     OB_Msg("Mode: PRIORITY (anchor-first). Anchor is queue #" .. OB_AnchorIndex)
   else
@@ -555,6 +676,29 @@ function OB_Anchor_Slash(msg)
   OB_Err("Anchor not found: " .. a)
 end
 
+-- NEW: Set cooldown seconds (priority mode only)
+function OB_CD_Slash(msg)
+  local a = Trim(msg or "")
+  local v = tonumber(a)
+  if not v then OB_Err("Usage: /obcd <seconds>"); return end
+  if v < 0 then v = 0 end
+  if v > 60 then v = 60 end
+  OB_CD_WINDOW = v
+  OB_Msg("Per-weapon soft cooldown set to " .. v .. "s (priority mode only)")
+end
+
+-- NEW: List cooldowns
+function OB_CDList_Slash()
+  if getn(OB_Queue) == 0 then OB_Msg("Queue empty."); return end
+  OB_Msg("Cooldowns (priority mode only):")
+  local i
+  for i = 1, getn(OB_Queue) do
+    local nm = OB_Queue[i]
+    local left = SecondsLeft(nm)
+    local f = Frame(); if f and f.AddMessage then f:AddMessage(string.format(" %2d. %s  %s", i, nm, (left > 0 and (string.format("%0.1fs left", left)) or "ready")), 0.8, 0.8, 0.8) end
+  end
+end
+
 -- ===== Slash registration (ArcaneFlow style) =====
 SLASH_OATHBREAKER1 = "/oathbreaker"
 SlashCmdList["OATHBREAKER"] = OathBreaker_Pulse
@@ -595,4 +739,12 @@ SlashCmdList["OBPRIORITY"] = OB_Priority_Slash
 SLASH_OBANCHOR1 = "/obanchor"
 SlashCmdList["OBANCHOR"] = OB_Anchor_Slash
 
--- End of OathBreaker.lua
+SLASH_OBCD1 = "/obcd"
+SlashCmdList["OBCD"] = OB_CD_Slash
+
+SLASH_OBCDLIST1 = "/obcdlist"
+SlashCmdList["OBCDLIST"] = OB_CDList_Slash
+
+-- End of OathBreaker.lua v1.3
+
+
