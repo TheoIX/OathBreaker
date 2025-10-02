@@ -1,30 +1,25 @@
 --[[
-OathBreaker.lua - Turtle WoW 1.12 (Lua 5.0 safe) - v1.3
+OathBreaker.lua - Turtle WoW 1.12 (Lua 5.0 safe) - v1.4
 Author: Theodan
 
-NEW in v1.3 (Priority-only cooldowns):
-  • Per-weapon soft cooldowns: when a weapon procs Holy Strength, it
-    gets a cooldown (default 13s) during which it will NOT be picked again.
-  • Anchor (priority) soft cooldown behavior: when the anchor's cooldown
-    reaches 0, OathBreaker will immediately switch back to the anchor even if
-    the current weapon hasn't procced yet (still within the same HS window).
-  • Round-robin mode is UNCHANGED — cooldowns are ignored there.
-  • Slash: /obcd <seconds> to set per-weapon cooldown (priority mode only).
-           /obcdlist to display remaining cooldowns.
+NEW in v1.4 (Swing-gated equips using your swing timer):
+  • Adds a post-swing gate that waits for your main-hand white swing to land,
+    detected via swing timer globals `st_timer` and `st_timerMax`, then equips
+    ~50 ms after that edge. No combat-log reads.
+  • Toggle with /obswinggate on|off (default: ON). If OFF, behavior is
+    identical to v1.3 timing.
 
-Retains v1.2.1 Priority Mode refinements:
-  • Anchor-specific tracking using the exact Holy Strength aura instance
-    (via expiration-time fingerprint) so we ONLY return to A when A’s proc
-    drops — unless the new soft-CD rule pulls us back earlier.
-  • Quiet retries by default.
+v1.3 recap (Priority-only cooldowns):
+  • Per-weapon soft cooldowns after Holy Strength proc (default 13s).
+  • When anchor CD reaches 0, snap back to anchor immediately (priority only).
+  • Round-robin mode ignores cooldowns.
 
 Key slash commands:
-  /obmode priority | round     -- choose priority (anchor-first) or round-robin
-  /obanchor <idx|name>         -- choose which queue slot is the anchor (default: 1)
-  /obquiet /obverbose          -- toggle chat noise (quiet by default)
-  /oathbreaker                 -- press to run logic (no background loops)
-  /obcd <seconds>              -- set soft cooldown window (default 13) for PRIORITY mode
-  /obcdlist                    -- show remaining cooldowns per weapon
+  /oathbreaker                 -- run logic once (macro/keypress)
+  /obmode priority | round     -- choose anchor-first vs round-robin
+  /obanchor <idx|name>         -- set anchor
+  /obcd <seconds> | /obcdlist  -- set/list soft cooldown (priority only)
+  /obswinggate on|off          -- enable/disable post-swing gating
 ]]
 
 -- ===== Fast locals (do NOT localize DEFAULT_CHAT_FRAME) =====
@@ -86,6 +81,66 @@ OB_AnchorExp    = nil    -- expiration fingerprint of the *anchor* HS instance
 -- NEW: Per-weapon cooldowns (priority mode ONLY)
 OB_CD_WINDOW    = 13     -- default seconds (can be changed via /obcd)
 OB_Cooldowns    = {}     -- map[strlower(name)] = expiresAt (GetTime-based)
+
+-- =====================
+-- Post-swing gate (uses swing timer globals st_timer/st_timerMax)
+-- =====================
+local OB_SwingGate        = true      -- default ON; toggle with /obswinggate
+local OB_POST_SWING_DELAY = 0.05      -- seconds after swing edge to equip
+local OB_WaitForNextSwing = false
+local OB_GatedName        = nil
+local OB_LastSwingTS      = 0
+local OB_prevPct          = nil       -- previous st_timer / st_timerMax
+
+-- Delay ticker that fires ~50ms after a detected swing edge
+local OB_DelayFrame = CreateFrame("Frame")
+OB_DelayFrame:Hide()
+OB_DelayFrame:SetScript("OnUpdate", function()
+  if not OB_WaitForNextSwing or not OB_GatedName then OB_DelayFrame:Hide(); return end
+  local t = (type(GetTime)=="function" and GetTime()) or 0
+  if (t - (OB_LastSwingTS or 0)) >= (OB_POST_SWING_DELAY or 0.05) then
+    local nm = OB_GatedName
+    OB_WaitForNextSwing = false
+    OB_GatedName = nil
+    OB_DelayFrame:Hide()
+    -- Hand back to normal equip path
+    OB_PendingName = nm
+    OathBreaker_Pulse()
+  end
+end)
+
+-- OnUpdate watcher that detects the rising edge of st_timer → st_timerMax
+local OB_ST_Frame = CreateFrame("Frame")
+OB_ST_Frame:Hide()
+OB_ST_Frame:SetScript("OnUpdate", function()
+  if not OB_WaitForNextSwing or not OB_SwingGate then return end
+  local cur, max = _G.st_timer, _G.st_timerMax
+  if type(cur) ~= "number" or type(max) ~= "number" or max <= 0 then OB_prevPct = nil; return end
+  local curPct = cur / max
+  -- Edge: near zero last frame, near full this frame (swing just happened)
+  if OB_prevPct and OB_prevPct < 0.08 and curPct > 0.90 then
+    local inRangeOK = true
+    if type(_G.SP_ST_InRange) == "function" then inRangeOK = _G.SP_ST_InRange() and true or false end
+    if inRangeOK then
+      OB_LastSwingTS = (type(GetTime)=="function" and GetTime()) or 0
+      OB_DelayFrame:Show()
+    end
+  end
+  OB_prevPct = curPct
+end)
+
+-- Public entry: call this instead of setting OB_PendingName directly
+function OB_RequestPostSwingSwap(name)
+  if not name or name == "" then return end
+  if not OB_SwingGate then
+    OB_PendingName = name
+    return
+  end
+  OB_GatedName = name
+  OB_WaitForNextSwing = true
+  OB_prevPct = nil
+  OB_ST_Frame:Show()
+end
 
 -- ===== Chat helpers =====
 local function Frame()
@@ -394,7 +449,7 @@ function OathBreaker_Pulse()
 
     -- EARLY RETURN TO ANCHOR when its soft-CD expires (even if no new proc)
     if OB_Chasing and SecondsLeft(anchorName) == 0 then
-      if not IsMainHandEquipped(anchorName) then OB_PendingName = anchorName end
+      if not IsMainHandEquipped(anchorName) then OB_RequestPostSwingSwap(anchorName) end
       OB_Chasing   = false
       OB_AnchorExp = nil     -- stop tracking the old anchor instance
       OB_Primed    = false   -- re-prime for next new HS
@@ -410,7 +465,7 @@ function OathBreaker_Pulse()
     if OB_Chasing then
       -- If all non-anchor weapons are on cooldown, snap back to anchor
       if AllNonAnchorOnCooldown() then
-        if not IsMainHandEquipped(anchorName) then OB_PendingName = anchorName end
+        if not IsMainHandEquipped(anchorName) then OB_RequestPostSwingSwap(anchorName) end
         OB_Chasing   = false
         OB_AnchorExp = nil
         OB_Primed    = false
@@ -421,7 +476,7 @@ function OathBreaker_Pulse()
         local currExps = FingerprintHS()
         local currSet  = BuildSetFromExps(currExps)
         if not currSet[OB_AnchorExp] then
-          if not IsMainHandEquipped(anchorName) then OB_PendingName = anchorName end
+          if not IsMainHandEquipped(anchorName) then OB_RequestPostSwingSwap(anchorName) end
           OB_Chasing   = false
           OB_AnchorExp = nil
           OB_Primed    = false
@@ -431,7 +486,7 @@ function OathBreaker_Pulse()
         -- fallback: if total drops below baseline, assume anchor fell
         local curr = OB_CurrentHSCount()
         if curr < OB_BaseCount then
-          if not IsMainHandEquipped(anchorName) then OB_PendingName = anchorName end
+          if not IsMainHandEquipped(anchorName) then OB_RequestPostSwingSwap(anchorName) end
           OB_Chasing   = false
           OB_AnchorExp = nil
           OB_Primed    = false
@@ -448,10 +503,10 @@ function OathBreaker_Pulse()
         local idx, nm = NextChaseCandidate()
         if idx and nm then
           OB_ChaseIndex = idx
-          if not IsMainHandEquipped(nm) then OB_PendingName = nm end
+          if not IsMainHandEquipped(nm) then OB_RequestPostSwingSwap(nm) end
         else
           -- No eligible non-anchor (all on cooldown): favor anchor uptime
-          if not IsMainHandEquipped(anchorName) then OB_PendingName = anchorName end
+          if not IsMainHandEquipped(anchorName) then OB_RequestPostSwingSwap(anchorName) end
           OB_Chasing   = false
           OB_AnchorExp = nil
           OB_Primed    = false
@@ -495,7 +550,7 @@ function OathBreaker_Pulse()
         local idx, nm = NextChaseCandidate()
         if idx and nm then
           OB_ChaseIndex = idx
-          if not IsMainHandEquipped(nm) then OB_PendingName = nm end
+          if not IsMainHandEquipped(nm) then OB_RequestPostSwingSwap(nm) end
         end
         return
       end
@@ -508,7 +563,7 @@ function OathBreaker_Pulse()
       while tries < n do
         local nextName = OB_Queue[OB_NextIndex]
         if not IsMainHandEquipped(nextName) then
-          OB_PendingName = nextName
+          OB_RequestPostSwingSwap(nextName)
           return
         else
           AdvanceIdx()
@@ -604,7 +659,7 @@ function OB_Next_Slash()
   else
     name = OB_Queue[OB_NextIndex]
   end
-  if not OB_PendingName then OB_PendingName = name end
+  if not OB_PendingName then OB_RequestPostSwingSwap(name) end
   OathBreaker_Pulse()
 end
 
@@ -699,7 +754,7 @@ function OB_CDList_Slash()
   end
 end
 
--- ===== Slash registration (ArcaneFlow style) =====
+-- ===== Slash registration =====
 SLASH_OATHBREAKER1 = "/oathbreaker"
 SlashCmdList["OATHBREAKER"] = OathBreaker_Pulse
 
@@ -745,6 +800,20 @@ SlashCmdList["OBCD"] = OB_CD_Slash
 SLASH_OBCDLIST1 = "/obcdlist"
 SlashCmdList["OBCDLIST"] = OB_CDList_Slash
 
--- End of OathBreaker.lua v1.3
+SLASH_OBSWINGGATE1 = "/obswinggate"
+SlashCmdList["OBSWINGGATE"] = function(msg)
+  local a = Trim(string.lower(msg or ""))
+  if a == "on" or a == "1" then
+    OB_SwingGate = true
+    OB_Msg("Post-swing gating: ON")
+  elseif a == "off" or a == "0" then
+    OB_SwingGate = false
+    OB_Msg("Post-swing gating: OFF")
+  else
+    OB_Msg("Usage: /obswinggate on|off")
+  end
+end
+
+-- End of OathBreaker.lua v1.4 (swing-gated)
 
 
