@@ -81,6 +81,7 @@ OB_AnchorExp    = nil    -- expiration fingerprint of the *anchor* HS instance
 -- NEW: Per-weapon cooldowns (priority mode ONLY)
 OB_CD_WINDOW    = 13     -- default seconds (can be changed via /obcd)
 OB_Cooldowns    = {}     -- map[strlower(name)] = expiresAt (GetTime-based)
+local OB_Enabled = False -- global gate; default ON
 
 -- =====================
 -- Post-swing gate (uses swing timer globals st_timer/st_timerMax)
@@ -165,6 +166,27 @@ local function Trim(s)
   local s2 = gsub(s, "^%s+", "")
   s2 = gsub(s2, "%s+$", "")
   return s2
+end
+
+local function OB_SetEnabled(on)
+  OB_Enabled = (on and true) or false
+  if OB_Enabled then
+    OB_Msg("ENABLED")
+    if type(PlaySoundFile) == "function" then
+      PlaySoundFile("Sound\\Creature\\Ashbringer\\ASH_SPEAK_12.Wav")
+    end
+  else
+    OB_Msg("DISABLED")
+    -- fully cancel any in-flight work so it truly "does nothing"
+    OB_PendingName     = nil
+    OB_WaitForNextSwing = false
+    OB_GatedName       = nil
+    if OB_DelayFrame then OB_DelayFrame:Hide() end
+    if OB_ST_Frame   then OB_ST_Frame:Hide() end
+    if type(PlaySoundFile) == "function" then
+      PlaySoundFile("Sound\\Creature\\Ashbringer\\ASH_SPEAK_03.Wav")
+    end
+  end
 end
 
 -- Lua 5.0-safe: extract [Name] from a WoW link string; return nil if not a link
@@ -418,6 +440,12 @@ end
 
 -- ===== Main pulse =====
 function OathBreaker_Pulse()
+  
+if not OB_Enabled then
+    -- Intentionally silent: when OFF, the command does nothing.
+    return
+  end
+
   local n = getn(OB_Queue)
   if n == 0 then OB_Err("Queue empty. Use /obadd <weapon>.") return end
 
@@ -814,6 +842,21 @@ SlashCmdList["OBSWINGGATE"] = function(msg)
   end
 end
 
+SLASH_OBTOGGLE1 = "/obtoggle"
+SlashCmdList["OBTOGGLE"] = function(msg)
+  local a = Trim(string.lower(msg or ""))
+  if a == "on" or a == "1" then
+    OB_SetEnabled(true)
+  elseif a == "off" or a == "0" then
+    OB_SetEnabled(false)
+  else
+    OB_SetEnabled(not OB_Enabled) -- plain "/obtoggle" flips it
+  end
+end
+
 -- End of OathBreaker.lua v1.4 (swing-gated)
+
+
+
 
 
